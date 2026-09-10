@@ -69,14 +69,20 @@ function desktopFetch(p, opts = {}) {
   });
 }
 
-function openaiMessagesToText(messages) {
-  return (messages || [])
-    .map((m) => {
-      const c = m.content;
-      const text = Array.isArray(c) ? c.map((p) => (typeof p === "string" ? p : p.text || "")).join("") : String(c || "");
-      return `${m.role || "user"}: ${text}`;
-    })
-    .join("\n");
+function contentToText(c) {
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) return c.map((p) => (typeof p === "string" ? p : p.text || "")).join("");
+  return String(c || "");
+}
+
+// 只发增量：Desktop 会话里本来就有历史，再把全量历史拼成一条发过去会导致
+// 上下文翻倍、agent 困惑。取最后一条 user 消息的纯文本即可连续对话。
+function lastUserText(messages) {
+  const arr = Array.isArray(messages) ? messages : [];
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if ((arr[i] || {}).role === "user") return contentToText(arr[i].content).slice(0, 35000);
+  }
+  return contentToText(arr.length ? arr[arr.length - 1].content : "").slice(0, 35000) || "hi";
 }
 
 function extractAssistantText(allMessages, sinceMs) {
@@ -95,6 +101,8 @@ function extractAssistantText(allMessages, sinceMs) {
 
 async function waitForReply(sid, sinceMs) {
   const deadline = Date.now() + config.timeoutMs;
+  let lastText = "";
+  let stableRounds = 0;
   while (Date.now() < deadline) {
     const r = await desktopFetch(`/v1/sessions/${encodeURIComponent(sid)}/messages`);
     if (r.status === 401) throw Object.assign(new Error("desktop unauthorized, token rotated?"), { code: 401 });
@@ -102,9 +110,20 @@ async function waitForReply(sid, sinceMs) {
     if (!r.ok) throw new Error(`desktop messages HTTP ${r.status}`);
     const list = await r.json();
     const text = extractAssistantText(Array.isArray(list) ? list : [], sinceMs);
-    if (text) return text;
+    // agent 是多步工具循环，第一段 text 出来不代表说完：
+    // 文本连续 3 轮不再增长才认为收完，避免只拿到半截。
+    if (text) {
+      if (text === lastText) {
+        stableRounds++;
+        if (stableRounds >= 3) return text;
+      } else {
+        lastText = text;
+        stableRounds = 0;
+      }
+    }
     await new Promise((r2) => setTimeout(r2, config.pollMs));
   }
+  if (lastText) return lastText;
   throw Object.assign(new Error("desktop reply timeout"), { code: 504 });
 }
 
@@ -140,7 +159,7 @@ const server = http.createServer(async (req, res) => {
     const model = String(body.model || config.allowedModels[0]);
     if (!config.allowedModels.includes(model)) return sendJson(res, 400, { error: { message: `model not allowed: ${model}` } });
     const sid = String(body.sid || config.defaultSid);
-    const message = openaiMessagesToText(body.messages).slice(0, 35000) || "hi";
+    const message = lastUserText(body.messages);
     const stream = body.stream !== false;
     const sinceMs = Date.now();
     try {
