@@ -42,8 +42,8 @@ pm2 save
 
 - `GET /health`：桥 + Desktop 健康
 - `GET /v1/models`：三个免费模型
-- `POST /v1/chat/completions`：OpenAI 兼容，`model` 三选一，`stream` 支持 `true/false`，需 `Authorization: Bearer <你的Key>`
-- `GET /admin/keys`：同 Key 鉴权，看各 Key 脱敏标识、绑定会话与调用计数
+- `POST /v1/chat/completions`：OpenAI 兼容，`model` 三选一，`stream` 支持 `true/false`，需 `Authorization: Bearer <你的Key>`，非流式回 `usage`
+- `GET /admin/keys`：同 Key 鉴权，看各 Key 脱敏标识、绑定会话、模型白名单与调用/token 计数
 - `POST /admin/reload`：改完 `config.json` 热重载，不用重启
 
 ```bash
@@ -56,5 +56,6 @@ curl -s -X POST http://127.0.0.1:3777/v1/chat/completions \
 ## 注意
 
 - 只绑 `127.0.0.1`，不要对外暴露；`desktop-api.json` 会随 App 重启轮换，桥已自动重载。
+- 给桥绑专用空会话，别复用你正在干活的会话：单会话一次只能跑一 turn，手头有活时桥会排队打满超时回 `429`。
 - `401` 重读一次 token，`503 not-logged-in` 去 App 重登。
 - 免费通道跟账号绑定，仅限本机自用，注意小米 ToS。

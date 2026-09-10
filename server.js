@@ -28,12 +28,17 @@ function loadConfig() {
 }
 let config = loadConfig();
 
-// 每个 Key 独立计数：用量、错误、末次使用，不记任何正文
+// 每个 Key 独立计数：用量、错误、token、末次使用，不记任何正文
 const stats = new Map();
-function touchStats(label, ok) {
-  const s = stats.get(label) || { requests: 0, errors: 0, lastUsed: "" };
+function touchStats(label, ok, usage) {
+  const s = stats.get(label) || { requests: 0, errors: 0, tokens: { input: 0, output: 0, total: 0 }, lastUsed: "" };
   s.requests++;
   if (!ok) s.errors++;
+  if (usage) {
+    s.tokens.input += usage.input || 0;
+    s.tokens.output += usage.output || 0;
+    s.tokens.total += usage.total || 0;
+  }
   s.lastUsed = new Date().toISOString();
   stats.set(label, s);
 }
@@ -111,21 +116,30 @@ function lastUserText(messages) {
 
 function extractAssistantText(allMessages, sinceMs) {
   const hits = [];
+  const usage = { input: 0, output: 0, total: 0 };
   for (const m of allMessages) {
     const info = m.info || {};
     if (info.role !== "assistant") continue;
     const created = info.time && info.time.created ? info.time.created : 0;
     if (created <= sinceMs) continue;
-    const texts = (m.parts || []).filter((p) => p.type === "text" && p.text).map((p) => p.text);
-    if (texts.length) hits.push({ created, text: texts.join("\n") });
+    for (const p of m.parts || []) {
+      if (p.type === "text" && p.text) hits.push({ created, text: p.text });
+      // step-finish 自带本 turn 的 tokens，直接累加做计量
+      if (p.type === "step-finish" && p.tokens) {
+        usage.input += p.tokens.input || 0;
+        usage.output += p.tokens.output || 0;
+        usage.total += p.tokens.total || 0;
+      }
+    }
   }
   hits.sort((a, b) => a.created - b.created);
-  return hits.map((h) => h.text).join("\n");
+  return { text: hits.map((h) => h.text).join("\n"), usage };
 }
 
 async function waitForReply(sid, sinceMs) {
   const deadline = Date.now() + config.timeoutMs;
   let lastText = "";
+  let lastUsage = { input: 0, output: 0, total: 0 };
   let stableRounds = 0;
   while (Date.now() < deadline) {
     const r = await desktopFetch(`/v1/sessions/${encodeURIComponent(sid)}/messages`);
@@ -133,21 +147,23 @@ async function waitForReply(sid, sinceMs) {
     if (r.status === 503) throw Object.assign(new Error("desktop not-logged-in"), { code: 503 });
     if (!r.ok) throw new Error(`desktop messages HTTP ${r.status}`);
     const list = await r.json();
-    const text = extractAssistantText(Array.isArray(list) ? list : [], sinceMs);
+    const { text, usage } = extractAssistantText(Array.isArray(list) ? list : [], sinceMs);
     // agent 是多步工具循环，第一段 text 出来不代表说完：
     // 文本连续 3 轮不再增长才认为收完，避免只拿到半截。
     if (text) {
       if (text === lastText) {
         stableRounds++;
-        if (stableRounds >= 3) return text;
+        lastUsage = usage;
+        if (stableRounds >= 3) return { text, usage };
       } else {
         lastText = text;
+        lastUsage = usage;
         stableRounds = 0;
       }
     }
     await new Promise((r2) => setTimeout(r2, config.pollMs));
   }
-  if (lastText) return lastText;
+  if (lastText) return { text: lastText, usage: lastUsage };
   throw Object.assign(new Error("desktop reply timeout"), { code: 504 });
 }
 
@@ -174,7 +190,7 @@ const server = http.createServer(async (req, res) => {
     const entry = authKey(req);
     if (!entry) return sendJson(res, 401, { error: { message: "invalid bridge key", type: "auth" } });
     return sendJson(res, 200, {
-      keys: config.keys.map((k) => ({ label: k.label || "default", key: maskKey(k.key), sid: k.sid || config.defaultSid || "", stats: stats.get(k.label || "default") || { requests: 0, errors: 0, lastUsed: "" } })),
+      keys: config.keys.map((k) => ({ label: k.label || "default", key: maskKey(k.key), sid: k.sid || config.defaultSid || "", models: k.models || config.allowedModels, stats: stats.get(k.label || "default") || { requests: 0, errors: 0, tokens: { input: 0, output: 0, total: 0 }, lastUsed: "" } })),
     });
   }
   if (req.method === "POST" && u.pathname === "/admin/reload") {
@@ -194,8 +210,9 @@ const server = http.createServer(async (req, res) => {
     } catch {
       return sendJson(res, 400, { error: { message: "body must be JSON" } });
     }
-    const model = String(body.model || config.allowedModels[0]);
-    if (!config.allowedModels.includes(model)) return sendJson(res, 400, { error: { message: `model not allowed: ${model}` } });
+    const allowed = entry.models || config.allowedModels;
+    const model = String(body.model || allowed[0]);
+    if (!allowed.includes(model)) return sendJson(res, 400, { error: { message: `model not allowed for this key: ${model}` } });
     // 一 Key 一会话：显式 sid > 该 Key 绑定的 sid > 全局默认，互不串味
     const sid = String(body.sid || entry.sid || config.defaultSid || "");
     if (!sid) {
@@ -205,21 +222,34 @@ const server = http.createServer(async (req, res) => {
     const message = lastUserText(body.messages);
     const stream = body.stream !== false;
     const sinceMs = Date.now();
+    const fail = (code, msg, type) => {
+      touchStats(label, false);
+      return sendJson(res, code, { error: { message: msg, type } });
+    };
     try {
-      const t = await desktopFetch(`/v1/sessions/${encodeURIComponent(sid)}/turns`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message, model }),
-      });
-      if (t.status === 401) return sendJson(res, 401, { error: { message: "desktop unauthorized, re-read desktop-api.json", type: "auth" } });
+      // 单会话一次只能跑一 turn：409 busy 就排队等到超时，而不是直接失败
+      let t = null;
+      const busyDeadline = Date.now() + config.timeoutMs;
+      for (;;) {
+        t = await desktopFetch(`/v1/sessions/${encodeURIComponent(sid)}/turns`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message, model }),
+        });
+        if (t.status !== 409) break;
+        if (Date.now() >= busyDeadline) break;
+        await new Promise((r2) => setTimeout(r2, 2000));
+      }
+      if (t.status === 401) return fail(401, "desktop unauthorized, re-read desktop-api.json", "auth");
+      if (t.status === 409) return fail(429, "desktop session busy, try again later", "rate_limit");
       if (!t.ok) {
         const txt = await t.text().catch(() => "");
-        return sendJson(res, 502, { error: { message: `desktop turns HTTP ${t.status} ${txt.slice(0, 200)}`, type: "upstream" } });
+        return fail(502, `desktop turns HTTP ${t.status} ${txt.slice(0, 200)}`, "upstream");
       }
-      const reply = await waitForReply(sid, sinceMs);
-      touchStats(label, true);
+      const { text: reply, usage } = await waitForReply(sid, sinceMs);
+      touchStats(label, true, usage);
       if (!stream) {
-        return sendJson(res, 200, { id: `chatcmpl-${Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, message: { role: "assistant", content: reply }, finish_reason: "stop" }] });
+        return sendJson(res, 200, { id: `chatcmpl-${Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, message: { role: "assistant", content: reply }, finish_reason: "stop" }], usage: { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.total } });
       }
       res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
       res.write(sseChunk(model, "", null));
