@@ -19,9 +19,33 @@ function loadConfig() {
   if (process.env.MIMO_SID) raw.defaultSid = process.env.MIMO_SID;
   if (process.env.DESKTOP_INFO_PATH) raw.desktopInfoPath = process.env.DESKTOP_INFO_PATH;
   raw.desktopInfoPath = expandHome(raw.desktopInfoPath);
+  // 多租户：keys 表优先，单 key 老配置自动兼容成 default 条目
+  if (!Array.isArray(raw.keys) || !raw.keys.length) {
+    raw.keys = [{ key: raw.bridgeKey || "change-me", label: "default", sid: raw.defaultSid || "" }];
+  }
+  raw.keys = raw.keys.filter((k) => k && typeof k.key === "string" && k.key && k.key !== "change-me" && !k.key.startsWith("PASTE_"));
   return raw;
 }
 let config = loadConfig();
+
+// 每个 Key 独立计数：用量、错误、末次使用，不记任何正文
+const stats = new Map();
+function touchStats(label, ok) {
+  const s = stats.get(label) || { requests: 0, errors: 0, lastUsed: "" };
+  s.requests++;
+  if (!ok) s.errors++;
+  s.lastUsed = new Date().toISOString();
+  stats.set(label, s);
+}
+function maskKey(k) {
+  if (typeof k !== "string" || k.length <= 8) return "****";
+  return `${k.slice(0, 4)}...${k.slice(-2)}`;
+}
+function authKey(req) {
+  const m = /^(?:Bearer[ \t]+)(\S+)$/i.exec(String(req.headers.authorization || "").trim());
+  if (!m) return null;
+  return config.keys.find((k) => k.key === m[1]) || null;
+}
 
 let desktop = { port: 0, token: "" };
 function reloadDesktop() {
@@ -145,11 +169,25 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && u.pathname === "/v1/models") {
     return sendJson(res, 200, { object: "list", data: config.allowedModels.map((id) => ({ id, object: "model", owned_by: "mimo-bridge" })) });
   }
+  // 管理面：同 Bearer 鉴权，只回脱敏 Key 与计数，不回正文
+  if (req.method === "GET" && u.pathname === "/admin/keys") {
+    const entry = authKey(req);
+    if (!entry) return sendJson(res, 401, { error: { message: "invalid bridge key", type: "auth" } });
+    return sendJson(res, 200, {
+      keys: config.keys.map((k) => ({ label: k.label || "default", key: maskKey(k.key), sid: k.sid || config.defaultSid || "", stats: stats.get(k.label || "default") || { requests: 0, errors: 0, lastUsed: "" } })),
+    });
+  }
+  if (req.method === "POST" && u.pathname === "/admin/reload") {
+    const entry = authKey(req);
+    if (!entry) return sendJson(res, 401, { error: { message: "invalid bridge key", type: "auth" } });
+    config = loadConfig();
+    reloadDesktop();
+    return sendJson(res, 200, { ok: true, keys: config.keys.length });
+  }
   if (req.method === "POST" && u.pathname === "/v1/chat/completions") {
-    if (config.bridgeKey && config.bridgeKey !== "change-me") {
-      const auth = req.headers.authorization || "";
-      if (auth !== `Bearer ${config.bridgeKey}`) return sendJson(res, 401, { error: { message: "invalid bridge key", type: "auth" } });
-    }
+    const entry = authKey(req);
+    if (!entry) return sendJson(res, 401, { error: { message: "invalid bridge key", type: "auth" } });
+    const label = entry.label || "default";
     let body;
     try {
       body = JSON.parse(await readBody(req));
@@ -158,7 +196,12 @@ const server = http.createServer(async (req, res) => {
     }
     const model = String(body.model || config.allowedModels[0]);
     if (!config.allowedModels.includes(model)) return sendJson(res, 400, { error: { message: `model not allowed: ${model}` } });
-    const sid = String(body.sid || config.defaultSid);
+    // 一 Key 一会话：显式 sid > 该 Key 绑定的 sid > 全局默认，互不串味
+    const sid = String(body.sid || entry.sid || config.defaultSid || "");
+    if (!sid) {
+      touchStats(label, false);
+      return sendJson(res, 400, { error: { message: "no session bound to this key: set sid for the key or pass sid per request" } });
+    }
     const message = lastUserText(body.messages);
     const stream = body.stream !== false;
     const sinceMs = Date.now();
@@ -174,6 +217,7 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 502, { error: { message: `desktop turns HTTP ${t.status} ${txt.slice(0, 200)}`, type: "upstream" } });
       }
       const reply = await waitForReply(sid, sinceMs);
+      touchStats(label, true);
       if (!stream) {
         return sendJson(res, 200, { id: `chatcmpl-${Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, message: { role: "assistant", content: reply }, finish_reason: "stop" }] });
       }
@@ -184,6 +228,7 @@ const server = http.createServer(async (req, res) => {
       res.write("data: [DONE]\n\n");
       res.end();
     } catch (e) {
+      touchStats(label, false);
       if (!res.headersSent) return sendJson(res, e.code === 504 ? 504 : 502, { error: { message: String(e.message), type: "upstream" } });
       try { res.end(); } catch {}
     }
