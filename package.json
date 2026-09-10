@@ -1,0 +1,12 @@
+{
+  "name": "mimo-bridge",
+  "version": "0.1.0",
+  "description": "MiMo Desktop free channel bridge: OpenAI-compatible interface",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
