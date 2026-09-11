@@ -327,10 +327,21 @@ const server = http.createServer(async (req, res) => {
         }
         const reader = r.body.getReader();
         const decoder = new TextDecoder();
+        // 上游 chunk 间隙超 25s 就补空事件：喂饱上游 60s idle 看门狗
+        let pending = null;
         for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const s = decoder.decode(value, { stream: true });
+          if (!pending) pending = reader.read();
+          let timer = null;
+          const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve("idle"), 25000); });
+          const got = await Promise.race([pending, timeout]);
+          if (got === "idle") {
+            sseHeartbeat(model, res);
+            continue;
+          }
+          clearTimeout(timer);
+          pending = null;
+          if (got.done) break;
+          const s = decoder.decode(got.value, { stream: true });
           if (s) res.write(s);
         }
         try { res.end(); } catch {}
