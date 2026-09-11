@@ -3,6 +3,7 @@ const http = require("http");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const directAuth = require("./direct-auth");
 
 function expandHome(p) {
   if (typeof p !== "string") return p;
@@ -19,6 +20,9 @@ function loadConfig() {
   if (process.env.MIMO_SID) raw.defaultSid = process.env.MIMO_SID;
   if (process.env.DESKTOP_INFO_PATH) raw.desktopInfoPath = process.env.DESKTOP_INFO_PATH;
   raw.desktopInfoPath = expandHome(raw.desktopInfoPath);
+  raw.mode = raw.mode || "desktop";
+  raw.directBase = (raw.directBase || "https://mimo-server-sgp.xiaomimimo.com/api").replace(/\/+$/, "");
+  if (raw.partitionDb) raw.partitionDb = expandHome(raw.partitionDb);
   // 多租户：keys 表优先，单 key 老配置自动兼容成 default 条目
   if (!Array.isArray(raw.keys) || !raw.keys.length) {
     raw.keys = [{ key: raw.bridgeKey || "change-me", label: "default", sid: raw.defaultSid || "" }];
@@ -172,6 +176,53 @@ function sseChunk(model, content, finish) {
   return `data: ${JSON.stringify(obj)}\n\n`;
 }
 
+// 直调：不经过 Desktop 会话，Cookie 换票后直发 route 网关
+// 注意：网关只接受 stream:true，非流式也在上游走流式再拼装
+async function directChat({ model, messages, stream, label }) {
+  const url = `${config.directBase}/route/chat/completions`;
+  const payload = { model, messages, stream: true, stream_options: { include_usage: true } };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const jar = await directAuth.getCookies(config.partitionDb, attempt === 1);
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        Cookie: directAuth.headerFor(jar),
+        "User-Agent": "MiMo-Desktop",
+        "X-Mimo-Source": "mimocode-desktop",
+      },
+      body: JSON.stringify(payload),
+    });
+    if (r.status === 401 && attempt === 0) continue;
+    return r;
+  }
+}
+
+function parseSseText(sse) {
+  let text = "";
+  const usage = { input: 0, output: 0, total: 0 };
+  for (const chunk of sse.split("\n\n")) {
+    for (const line of chunk.split("\n")) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const data = t.slice(5).trim();
+      if (!data || data === "[DONE]") continue;
+      try {
+        const j = JSON.parse(data);
+        const d = j.choices && j.choices[0];
+        if (d && d.delta && typeof d.delta.content === "string") text += d.delta.content;
+        if (j.usage) {
+          usage.input += j.usage.prompt_tokens || 0;
+          usage.output += j.usage.completion_tokens || 0;
+          usage.total += j.usage.total_tokens || 0;
+        }
+      } catch {}
+    }
+  }
+  return { text, usage };
+}
+
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url || "/", "http://x");
   if (req.method === "GET" && u.pathname === "/health") {
@@ -190,7 +241,7 @@ const server = http.createServer(async (req, res) => {
     const entry = authKey(req);
     if (!entry) return sendJson(res, 401, { error: { message: "invalid bridge key", type: "auth" } });
     return sendJson(res, 200, {
-      keys: config.keys.map((k) => ({ label: k.label || "default", key: maskKey(k.key), sid: k.sid || config.defaultSid || "", models: k.models || config.allowedModels, stats: stats.get(k.label || "default") || { requests: 0, errors: 0, tokens: { input: 0, output: 0, total: 0 }, lastUsed: "" } })),
+      keys: config.keys.map((k) => ({ label: k.label || "default", key: maskKey(k.key), mode: k.mode || config.mode || "desktop", sid: k.sid || config.defaultSid || "", models: k.models || config.allowedModels, stats: stats.get(k.label || "default") || { requests: 0, errors: 0, tokens: { input: 0, output: 0, total: 0 }, lastUsed: "" } })),
     });
   }
   if (req.method === "POST" && u.pathname === "/admin/reload") {
@@ -213,6 +264,40 @@ const server = http.createServer(async (req, res) => {
     const allowed = entry.models || config.allowedModels;
     const model = String(body.model || allowed[0]);
     if (!allowed.includes(model)) return sendJson(res, 400, { error: { message: `model not allowed for this key: ${model}` } });
+    // 双模式：一 Key 一模式，默认 desktop；direct 不碰 Desktop 会话
+    const runMode = entry.mode || config.mode || "desktop";
+    const stream = body.stream !== false;
+    if (runMode === "direct") {
+      try {
+        const r = await directChat({ model, messages: Array.isArray(body.messages) ? body.messages : [], stream, label });
+        if (!r.ok) {
+          const txt = await r.text().catch(() => "");
+          touchStats(label, false);
+          return sendJson(res, r.status >= 500 ? 502 : r.status, { error: { message: `upstream ${r.status} ${txt.slice(0, 200)}`, type: "upstream" } });
+        }
+        if (!stream) {
+          const { text, usage } = parseSseText(await r.text());
+          touchStats(label, true, { input: usage.input, output: usage.output, total: usage.total });
+          return sendJson(res, 200, { id: `chatcmpl-${Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }], usage: { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.total } });
+        }
+        res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const s = decoder.decode(value, { stream: true });
+          if (s) res.write(s);
+        }
+        try { res.end(); } catch {}
+        touchStats(label, true);
+      } catch (e) {
+        touchStats(label, false);
+        if (!res.headersSent) return sendJson(res, 502, { error: { message: String(e.message).slice(0, 300), type: "upstream" } });
+        try { res.end(); } catch {}
+      }
+      return;
+    }
     // 一 Key 一会话：显式 sid > 该 Key 绑定的 sid > 全局默认，互不串味
     const sid = String(body.sid || entry.sid || config.defaultSid || "");
     if (!sid) {
@@ -220,7 +305,6 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 400, { error: { message: "no session bound to this key: set sid for the key or pass sid per request" } });
     }
     const message = lastUserText(body.messages);
-    const stream = body.stream !== false;
     const sinceMs = Date.now();
     const fail = (code, msg, type) => {
       touchStats(label, false);

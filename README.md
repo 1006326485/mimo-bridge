@@ -38,6 +38,24 @@ pm2 save
 `sid` 去 Desktop 里新建一个空会话，从 `GET /v1/sessions` 抄它的 `id` 填上即可。
 单次请求也可用 `"sid"` 字段临时覆盖。只发增量（最后一条 user），连续对话靠会话历史本身。
 
+## 双模式（可配置）
+
+- `desktop`：经 Desktop 会话 `turns`，稳定但 UI/本地库留痕，单会话一次一 turn
+- `direct`：headless 换票后直调网关，不碰 Desktop 会话、无本地痕迹，原生多轮（全量历史直传）与真实用量
+
+全局 `mode` + 每 Key `mode` 覆盖，不写默认 `desktop`：
+
+```json
+{ "mode": "desktop",
+  "keys": [
+    { "key": "KEY_FOR_PROJECT_A", "label": "project-a", "mode": "desktop", "sid": "ses_AAA" },
+    { "key": "KEY_FOR_DIRECT", "label": "direct-demo", "mode": "direct" }
+  ] }
+```
+
+`direct` 首次调用会起一次 headless Chrome 换票（几秒），票缓存 20 小时，401 自动重换。
+注意网关只接受流式上游，桥内已强制 `stream:true` 再按需拼装，不影响对外形态。
+
 ## 接口
 
 - `GET /health`：桥 + Desktop 健康

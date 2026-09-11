@@ -5,8 +5,10 @@
   "allowedModels": ["mimo-x-flash-preview", "mimo-x-pro-preview", "mimo-auto"],
   "pollMs": 500,
   "timeoutMs": 60000,
+  "mode": "desktop",
+  "directBase": "https://mimo-server-sgp.xiaomimimo.com/api",
   "keys": [
-    { "key": "PASTE_KEY_FOR_PROJECT_A", "label": "project-a", "sid": "ses_CHANGE_ME" },
-    { "key": "PASTE_KEY_FOR_AGENT_CODE", "label": "agent-code", "sid": "ses_CHANGE_ME_TOO" }
+    { "key": "PASTE_KEY_FOR_PROJECT_A", "label": "project-a", "mode": "desktop", "sid": "ses_CHANGE_ME" },
+    { "key": "PASTE_KEY_FOR_DIRECT", "label": "direct-demo", "mode": "direct" }
   ]
 }

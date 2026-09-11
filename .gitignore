@@ -1,4 +1,6 @@
 node_modules/
 *.log
 config.json
+.direct-cookies.json
+.direct-profile/
 .DS_Store
