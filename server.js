@@ -146,11 +146,12 @@ function extractAssistantText(allMessages, sinceMs) {
   return { text: hits.map((h) => h.text).join("\n"), usage };
 }
 
-async function waitForReply(sid, sinceMs) {
+async function waitForReply(sid, sinceMs, onProgress) {
   const deadline = Date.now() + config.timeoutMs;
   let lastText = "";
   let lastUsage = { input: 0, output: 0, total: 0 };
   let stableRounds = 0;
+  let lastBeat = Date.now();
   while (Date.now() < deadline) {
     const r = await desktopFetch(`/v1/sessions/${encodeURIComponent(sid)}/messages`);
     if (r.status === 401) throw Object.assign(new Error("desktop unauthorized, token rotated?"), { code: 401 });
@@ -172,6 +173,10 @@ async function waitForReply(sid, sinceMs) {
       }
     }
     await new Promise((r2) => setTimeout(r2, config.pollMs));
+    if (onProgress && Date.now() - lastBeat > 20000) {
+      lastBeat = Date.now();
+      try { onProgress(); } catch {}
+    }
   }
   if (lastText) return { text: lastText, usage: lastUsage };
   throw Object.assign(new Error("desktop reply timeout"), { code: 504 });
@@ -180,6 +185,11 @@ async function waitForReply(sid, sinceMs) {
 function sseChunk(model, content, finish) {
   const obj = { id: `chatcmpl-${Date.now()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: content ? { content } : {}, finish_reason: finish || null }] };
   return `data: ${JSON.stringify(obj)}\n\n`;
+}
+// 空 delta 心跳：合法 OpenAI 空事件，下游转换直接忽略。
+// 用来立刻清掉上游 15s 首字节断头台，桌面模式等待期间每 20s 一次防 idle。
+function sseHeartbeat(model, res) {
+  try { res.write(sseChunk(model, "", null)); } catch {}
 }
 
 // 直调：不经过 Desktop 会话，Cookie 换票后直发 route 网关
@@ -277,13 +287,33 @@ const server = http.createServer(async (req, res) => {
     const t0 = Date.now();
     const done = (status, extra) => console.log(`[bridge] ${label} ${runMode} model=${model} stream=${stream} -> ${status} ${Date.now() - t0}ms${extra ? " " + extra : ""}`);
     if (runMode === "direct") {
+      // 流式先等上游回头最多 8s：正常情况直接透传状态码；
+      // 上游回头慢才落头+心跳，顶掉 15s 断头台（此时上游 HTTP 错只能以截流收尾）。
+      let r = null;
+      let headed = false;
+      if (stream) {
+        const pending = directChat({ model, messages: Array.isArray(body.messages) ? body.messages : [], stream, label });
+        const slow = new Promise((resolve) => setTimeout(() => resolve("slow"), 10000));
+        const won = await Promise.race([pending.then((v) => ({ v })), slow]);
+        if (won === "slow") {
+          res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
+          sseHeartbeat(model, res);
+          headed = true;
+          r = await pending;
+        } else {
+          r = won.v;
+        }
+      } else {
+        r = await directChat({ model, messages: Array.isArray(body.messages) ? body.messages : [], stream, label });
+      }
       try {
-        const r = await directChat({ model, messages: Array.isArray(body.messages) ? body.messages : [], stream, label });
         if (!r.ok) {
           const txt = await r.text().catch(() => "");
           touchStats(label, false);
           done(r.status >= 500 ? 502 : r.status, "direct-upstream");
-          return sendJson(res, r.status >= 500 ? 502 : r.status, { error: { message: `upstream ${r.status} ${txt.slice(0, 200)}`, type: "upstream" } });
+          if (!res.headersSent) return sendJson(res, r.status >= 500 ? 502 : r.status, { error: { message: `upstream ${r.status} ${txt.slice(0, 200)}`, type: "upstream" } });
+          try { res.end(); } catch {}
+          return;
         }
         if (!stream) {
           const { text, usage } = parseSseText(await r.text());
@@ -291,7 +321,10 @@ const server = http.createServer(async (req, res) => {
           done(200, `direct usage=${usage.total}`);
           return sendJson(res, 200, { id: `chatcmpl-${Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }], usage: { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.total } });
         }
-        res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
+        if (!headed) {
+          res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
+          sseHeartbeat(model, res);
+        }
         const reader = r.body.getReader();
         const decoder = new TextDecoder();
         for (;;) {
@@ -322,8 +355,14 @@ const server = http.createServer(async (req, res) => {
     const fail = (code, msg, type) => {
       touchStats(label, false);
       done(code, `desktop-${type}`);
-      return sendJson(res, code, { error: { message: msg, type } });
+      if (!res.headersSent) return sendJson(res, code, { error: { message: msg, type } });
+      try { res.end(); } catch {}
     };
+    // 流式先落头+心跳：上游 15s 首字节断头台清掉，后面慢慢等 Desktop
+    if (stream) {
+      res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
+      sseHeartbeat(model, res);
+    }
     try {
       // 单会话一次只能跑一 turn：409 busy 就排队等到超时，而不是直接失败
       let t = null;
@@ -344,13 +383,12 @@ const server = http.createServer(async (req, res) => {
         const txt = await t.text().catch(() => "");
         return fail(502, `desktop turns HTTP ${t.status} ${txt.slice(0, 200)}`, "upstream");
       }
-      const { text: reply, usage } = await waitForReply(sid, sinceMs);
+      const { text: reply, usage } = await waitForReply(sid, sinceMs, stream ? () => sseHeartbeat(model, res) : undefined);
       touchStats(label, true, usage);
       if (!stream) {
         done(200, `desktop usage=${usage.total}`);
         return sendJson(res, 200, { id: `chatcmpl-${Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, message: { role: "assistant", content: reply }, finish_reason: "stop" }], usage: { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.total } });
       }
-      res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
       res.write(sseChunk(model, "", null));
       for (let i = 0; i < reply.length; i += 800) res.write(sseChunk(model, reply.slice(i, i + 800), null));
       res.write(sseChunk(model, "", "stop"));
