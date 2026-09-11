@@ -2,7 +2,7 @@
   "bridgePort": 3777,
   "desktopInfoPath": "~/Library/Application Support/Xiaomi MiMo AI/desktop-api.json",
   "defaultSid": "ses_CHANGE_ME",
-  "allowedModels": ["mimo-x-flash-preview", "mimo-x-pro-preview", "mimo-auto"],
+  "allowedModels": ["mimo-x-flash-preview", "mimo-x-pro-preview"],
   "pollMs": 500,
   "timeoutMs": 60000,
   "mode": "desktop",

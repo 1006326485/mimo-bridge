@@ -4,7 +4,7 @@ MiMo Desktop 免费通道桥：把本机已登录的 MiMo Desktop 包装成标�
 
 ## 原理
 
-`mimo-x-flash-preview / mimo-x-pro-preview / mimo-auto` 命中 Desktop 的 `proxy` 路：
+`mimo-x-flash-preview / mimo-x-pro-preview` 走 Desktop 的 `proxy` 路：
 
 `POST https://mimo-server-sgp.xiaomimimo.com/api/route/chat/completions`
 

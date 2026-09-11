@@ -107,15 +107,12 @@ function contentToText(c) {
   if (Array.isArray(c)) return c.map((p) => (typeof p === "string" ? p : p.text || "")).join("");
   return String(c || "");
 }
-
 // 对齐 Desktop 自身 Db() 语义：允许 "provider/model" 写法，取 / 后为真模型名
 function normalizeModel(m) {
   const s = String(m || "");
   const i = s.indexOf("/");
   return i > 0 && i < s.length - 1 ? s.slice(i + 1) : s;
 }
-// mimo-auto 只是 Desktop 内部别名，网关不认，仅直调时落到 flash
-const DIRECT_ALIASES = { "mimo-auto": "mimo-x-flash-preview" };
 
 // 只发增量：Desktop 会话里本来就有历史，再把全量历史拼成一条发过去会导致
 // 上下文翻倍、agent 困惑。取最后一条 user 消息的纯文本即可连续对话。
@@ -281,7 +278,7 @@ const server = http.createServer(async (req, res) => {
     const done = (status, extra) => console.log(`[bridge] ${label} ${runMode} model=${model} stream=${stream} -> ${status} ${Date.now() - t0}ms${extra ? " " + extra : ""}`);
     if (runMode === "direct") {
       try {
-        const r = await directChat({ model: DIRECT_ALIASES[model] || model, messages: Array.isArray(body.messages) ? body.messages : [], stream, label });
+        const r = await directChat({ model, messages: Array.isArray(body.messages) ? body.messages : [], stream, label });
         if (!r.ok) {
           const txt = await r.text().catch(() => "");
           touchStats(label, false);
