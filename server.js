@@ -329,6 +329,7 @@ const server = http.createServer(async (req, res) => {
         const decoder = new TextDecoder();
         // 上游 chunk 间隙超 25s 就补空事件：喂饱上游 60s idle 看门狗
         let pending = null;
+        let seenDone = false;
         for (;;) {
           if (!pending) pending = reader.read();
           let timer = null;
@@ -342,8 +343,13 @@ const server = http.createServer(async (req, res) => {
           pending = null;
           if (got.done) break;
           const s = decoder.decode(got.value, { stream: true });
-          if (s) res.write(s);
+          if (s) {
+            if (s.includes("[DONE]")) seenDone = true;
+            res.write(s);
+          }
         }
+        // 上游干净断流却没发哨兵就补一个，避免下游报 ended-before-DONE 而整单作废
+        if (!seenDone) res.write("data: [DONE]\n\n");
         try { res.end(); } catch {}
         touchStats(label, true);
         done(200, "direct-stream");
