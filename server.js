@@ -299,7 +299,13 @@ const server = http.createServer(async (req, res) => {
           res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
           sseHeartbeat(model, res);
           headed = true;
-          r = await pending;
+          // 上游回头前的真空期也要保活：每 20s 一次，直到 fetch 落定
+          const keep = setInterval(() => sseHeartbeat(model, res), 20000);
+          try {
+            r = await pending;
+          } finally {
+            clearInterval(keep);
+          }
         } else {
           r = won.v;
         }
