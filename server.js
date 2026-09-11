@@ -197,19 +197,29 @@ function sseHeartbeat(model, res) {
 async function directChat({ model, messages, stream, label }) {
   const url = `${config.directBase}/route/chat/completions`;
   const payload = { model, messages, stream: true, stream_options: { include_usage: true } };
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const jar = await directAuth.getCookies(config.partitionDb, attempt === 1);
-    const r = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream",
-        Cookie: directAuth.headerFor(jar),
-        "User-Agent": "MiMo-Desktop",
-        "X-Mimo-Source": "mimocode-desktop",
-      },
-      body: JSON.stringify(payload),
-    });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const jar = await directAuth.getCookies(config.partitionDb, attempt >= 1);
+    let r = null;
+    try {
+      r = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          Cookie: directAuth.headerFor(jar),
+          "User-Agent": "MiMo-Desktop",
+          "X-Mimo-Source": "mimocode-desktop",
+        },
+        body: JSON.stringify(payload),
+      });
+    } catch (e) {
+      // 建连层被重置（对方 RST/超时）：下游无感知，重打一次
+      if (attempt < 2) {
+        await new Promise((x) => setTimeout(x, 1000 * (attempt + 1)));
+        continue;
+      }
+      throw e;
+    }
     if (r.status === 401 && attempt === 0) continue;
     return r;
   }
@@ -361,7 +371,7 @@ const server = http.createServer(async (req, res) => {
         done(200, "direct-stream");
       } catch (e) {
         touchStats(label, false);
-        done("ERR", "direct");
+        done("ERR", "direct:"+String((e&&e.message)||e).slice(0,120));
         if (!res.headersSent) return sendJson(res, 502, { error: { message: String(e.message).slice(0, 300), type: "upstream" } });
         try { res.end(); } catch {}
       }
@@ -420,7 +430,7 @@ const server = http.createServer(async (req, res) => {
       done(200, "desktop-stream");
     } catch (e) {
       touchStats(label, false);
-      done("ERR", "desktop");
+      done("ERR", "desktop:"+String((e&&e.message)||e).slice(0,120));
       if (!res.headersSent) return sendJson(res, e.code === 504 ? 504 : 502, { error: { message: String(e.message), type: "upstream" } });
       try { res.end(); } catch {}
     }
