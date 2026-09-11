@@ -108,6 +108,15 @@ function contentToText(c) {
   return String(c || "");
 }
 
+// 对齐 Desktop 自身 Db() 语义：允许 "provider/model" 写法，取 / 后为真模型名
+function normalizeModel(m) {
+  const s = String(m || "");
+  const i = s.indexOf("/");
+  return i > 0 && i < s.length - 1 ? s.slice(i + 1) : s;
+}
+// mimo-auto 只是 Desktop 内部别名，网关不认，仅直调时落到 flash
+const DIRECT_ALIASES = { "mimo-auto": "mimo-x-flash-preview" };
+
 // 只发增量：Desktop 会话里本来就有历史，再把全量历史拼成一条发过去会导致
 // 上下文翻倍、agent 困惑。取最后一条 user 消息的纯文本即可连续对话。
 function lastUserText(messages) {
@@ -262,22 +271,27 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 400, { error: { message: "body must be JSON" } });
     }
     const allowed = entry.models || config.allowedModels;
-    const model = String(body.model || allowed[0]);
-    if (!allowed.includes(model)) return sendJson(res, 400, { error: { message: `model not allowed for this key: ${model}` } });
+    const rawModel = String(body.model || allowed[0]);
+    const model = normalizeModel(rawModel);
+    if (!allowed.includes(model)) return sendJson(res, 400, { error: { message: `model not allowed for this key: ${rawModel}` } });
     // 双模式：一 Key 一模式，默认 desktop；direct 不碰 Desktop 会话
     const runMode = entry.mode || config.mode || "desktop";
     const stream = body.stream !== false;
+    const t0 = Date.now();
+    const done = (status, extra) => console.log(`[bridge] ${label} ${runMode} model=${model} stream=${stream} -> ${status} ${Date.now() - t0}ms${extra ? " " + extra : ""}`);
     if (runMode === "direct") {
       try {
-        const r = await directChat({ model, messages: Array.isArray(body.messages) ? body.messages : [], stream, label });
+        const r = await directChat({ model: DIRECT_ALIASES[model] || model, messages: Array.isArray(body.messages) ? body.messages : [], stream, label });
         if (!r.ok) {
           const txt = await r.text().catch(() => "");
           touchStats(label, false);
+          done(r.status >= 500 ? 502 : r.status, "direct-upstream");
           return sendJson(res, r.status >= 500 ? 502 : r.status, { error: { message: `upstream ${r.status} ${txt.slice(0, 200)}`, type: "upstream" } });
         }
         if (!stream) {
           const { text, usage } = parseSseText(await r.text());
           touchStats(label, true, { input: usage.input, output: usage.output, total: usage.total });
+          done(200, `direct usage=${usage.total}`);
           return sendJson(res, 200, { id: `chatcmpl-${Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }], usage: { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.total } });
         }
         res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
@@ -291,8 +305,10 @@ const server = http.createServer(async (req, res) => {
         }
         try { res.end(); } catch {}
         touchStats(label, true);
+        done(200, "direct-stream");
       } catch (e) {
         touchStats(label, false);
+        done("ERR", "direct");
         if (!res.headersSent) return sendJson(res, 502, { error: { message: String(e.message).slice(0, 300), type: "upstream" } });
         try { res.end(); } catch {}
       }
@@ -308,6 +324,7 @@ const server = http.createServer(async (req, res) => {
     const sinceMs = Date.now();
     const fail = (code, msg, type) => {
       touchStats(label, false);
+      done(code, `desktop-${type}`);
       return sendJson(res, code, { error: { message: msg, type } });
     };
     try {
@@ -333,6 +350,7 @@ const server = http.createServer(async (req, res) => {
       const { text: reply, usage } = await waitForReply(sid, sinceMs);
       touchStats(label, true, usage);
       if (!stream) {
+        done(200, `desktop usage=${usage.total}`);
         return sendJson(res, 200, { id: `chatcmpl-${Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, message: { role: "assistant", content: reply }, finish_reason: "stop" }], usage: { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.total } });
       }
       res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
@@ -341,8 +359,10 @@ const server = http.createServer(async (req, res) => {
       res.write(sseChunk(model, "", "stop"));
       res.write("data: [DONE]\n\n");
       res.end();
+      done(200, "desktop-stream");
     } catch (e) {
       touchStats(label, false);
+      done("ERR", "desktop");
       if (!res.headersSent) return sendJson(res, e.code === 504 ? 504 : 502, { error: { message: String(e.message), type: "upstream" } });
       try { res.end(); } catch {}
     }
