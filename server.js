@@ -186,12 +186,18 @@ function sseChunk(model, content, finish) {
   const obj = { id: `chatcmpl-${Date.now()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: content ? { content } : {}, finish_reason: finish || null }] };
   return `data: ${JSON.stringify(obj)}\n\n`;
 }
-// 空 delta 心跳：标准 SSE 注释，下游按规范忽略，不污染 JSON 流。
-// 用来立刻清掉上游 15s 首字节断头台，桌面模式等待期间每 20s 一次防 idle。
-// 注意：之前用过伪造的 chat.completion.chunk 做心跳，id 与上游真实 id 不一致，
-// 严格客户端可能校验失败，改用注释更安全。
-function sseHeartbeat(model, res) {
-  try { res.write(`: heartbeat ${Date.now()}\n\n`); } catch {}
+// 空 delta 心跳：合法 OpenAI 空事件。
+// 必须用 data 块而不能用 SSE 注释：ai-proxy 只把 `data: ` 行计为活动
+// （清 15s 首块超时和 60s chunk 间隙看门狗），注释会被忽略导致慢首 token
+// 请求误判 timeout。id 固定为本流 id，避免与上游真实 id 不一致。
+function sseHeartbeat(model, res, streamId) {
+  try {
+    const id = streamId || `chatcmpl-${Date.now()}`;
+    res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: null }] })}\n\n`);
+  } catch (e) {
+    // 心跳写失败必须可见：静默吞掉会让「上游静默 vs 心跳链路断了」无法归因
+    console.log(`[bridge] heartbeat write failed: ${String((e && e.message) || e)}`);
+  }
 }
 function sseErrorAndDone(res, message) {
   try { res.write(`data: ${JSON.stringify({ error: { message: String(message).slice(0, 500), type: "upstream" } })}\n\n`); } catch {}
@@ -221,6 +227,13 @@ async function directChat({ model, messages, stream, label, passthrough }) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const jar = await directAuth.getCookies(config.partitionDb, attempt >= 1);
     let r = null;
+    // 90s 仅限落头（响应头）：fetch 一 resolve 就解除，流式阶段不设总时长上限。
+    // 不能用 AbortSignal.timeout(90000)——它覆盖整个请求含 body，会在 90s 掐断
+    // 正在生成的长推理流（实测 107/125 次截流精确落在 90.0s），补出的 error+ [DONE]
+    // 又被 ai-proxy 吞成「ended without a terminal finish_reason」。
+    // 流中段停滞由 25s 心跳 + 下游 60s chunk 间隙看门狗兜底（裸 fetch 默认 300s）。
+    const ac = new AbortController();
+    const headTimer = setTimeout(() => ac.abort(new DOMException("upstream headers timeout after 90s", "TimeoutError")), 90000);
     try {
       r = await fetch(url, {
         method: "POST",
@@ -232,14 +245,19 @@ async function directChat({ model, messages, stream, label, passthrough }) {
           "X-Mimo-Source": "mimocode-desktop",
         },
         body: JSON.stringify(payload),
+        signal: ac.signal,
       });
     } catch (e) {
+      // 落头超时不是建连层 RST，重试只会再拖 90s：直接抛给上层收尾
+      if (e && e.name === "TimeoutError") throw e;
       // 建连层被重置（对方 RST/超时）：下游无感知，重打一次
       if (attempt < 2) {
         await new Promise((x) => setTimeout(x, 1000 * (attempt + 1)));
         continue;
       }
       throw e;
+    } finally {
+      clearTimeout(headTimer);
     }
     if (r.status === 401 && attempt === 0) continue;
     return r;
@@ -342,22 +360,26 @@ const server = http.createServer(async (req, res) => {
     const t0 = Date.now();
     const done = (status, extra) => console.log(`[bridge] ${label} ${runMode} model=${model} stream=${stream} -> ${status} ${Date.now() - t0}ms${extra ? " " + extra : ""}`);
     if (runMode === "direct") {
-      // 流式先等上游回头最多 8s：正常情况直接透传状态码；
-      // 上游回头慢才落头+心跳，顶掉 15s 断头台（此时上游 HTTP 错只能以截流收尾）。
+      // 流式先等上游回头最多 10s：正常情况直接透传状态码；
+      // 上游回头慢才落头+心跳，喂饱 ai-proxy 15s 首块超时（此时上游 HTTP 错
+      // 以 SSE 错误事件 + [DONE] 收尾，不截流）。
       let r = null;
       let headed = false;
+      // 心跳用固定 id，避免每次心跳 id 都变
+      const hbId = `chatcmpl-${Date.now().toString(36)}${Math.floor(Math.random() * 1296).toString(36).padStart(2, "0")}`;
       if (stream) {
         const pending = directChat({ model, messages: Array.isArray(body.messages) ? body.messages : [], stream, label, passthrough: buildPassthrough(body) });
         const slow = new Promise((resolve) => setTimeout(() => resolve("slow"), 10000));
         const won = await Promise.race([pending.then((v) => ({ v })), slow]);
         if (won === "slow") {
           res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
-          sseHeartbeat(model, res);
+          sseHeartbeat(model, res, hbId);
           headed = true;
           // 上游回头前的真空期也要保活：每 20s 一次，直到 fetch 落定
-          const keep = setInterval(() => sseHeartbeat(model, res), 20000);
+          const keep = setInterval(() => sseHeartbeat(model, res, hbId), 20000);
           try {
             r = await pending;
+            console.log(`[bridge] upstream headers after ${Date.now() - t0}ms`);
           } finally {
             clearInterval(keep);
           }
@@ -392,18 +414,20 @@ const server = http.createServer(async (req, res) => {
         }
         if (!headed) {
           res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
-          sseHeartbeat(model, res);
+          sseHeartbeat(model, res, hbId);
         }
         const reader = r.body.getReader();
         const decoder = new TextDecoder();
         // 下游提前断开就别再写 socket，否则 EPIPE 抛到 catch 里误记为上游错
         let clientClosed = false;
         try { req.on("close", () => { clientClosed = true; try { reader.cancel(); } catch {} }); } catch {}
-        // 上游 chunk 间隙超 25s 就补注释心跳：只保下游 idle，不保上游
+        // 上游 chunk 间隙超 25s 就补空 data 心跳：既保 TCP，也喂饱 ai-proxy
+        // 60s chunk 间隙看门狗（注释行不被计为活动）
         let pending = null;
         let seenDone = false;
         let tail = "";
         let carry = "";
+        let lastDataAt = Date.now();
         const normalizeSse = (text) => text.replace(/(^|\n)data:(?=\S)/g, "$1data: ");
         for (;;) {
           if (clientClosed) break;
@@ -412,7 +436,9 @@ const server = http.createServer(async (req, res) => {
           const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve("idle"), 25000); });
           const got = await Promise.race([pending, timeout]);
           if (got === "idle") {
-            sseHeartbeat(model, res);
+            const gap = Date.now() - lastDataAt;
+            if (gap >= 60000) console.log(`[bridge] upstream silent ${gap}ms model=${model}, heartbeating downstream`);
+            sseHeartbeat(model, res, hbId);
             continue;
           }
           clearTimeout(timer);
@@ -420,6 +446,7 @@ const server = http.createServer(async (req, res) => {
           if (got.done) break;
           const s = decoder.decode(got.value, { stream: true });
           if (s) {
+            lastDataAt = Date.now();
             // [DONE] 可能被 TCP 切成两段，用 tail 拼接后再判，避免漏判导致重复补哨兵
             if ((tail + s).includes("[DONE]")) seenDone = true;
             tail = (tail + s).slice(-16);
